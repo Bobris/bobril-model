@@ -1,0 +1,15 @@
+{
+  "name": "bobril-model",
+  "version": "0.0.1",
+  "description": "Bobril model",
+  "main": "dist/index.js",
+  "dependencies": {},
+  "devDependencies": {
+    "jasmine-node": "^1.14.5"
+  },
+  "scripts": {
+    "test": "jasmine-node ./spec/ --autotest --watch ./src/ --watch ./spec/"
+  },
+  "author": "Boris Letocha",
+  "license": "MIT"
+}
