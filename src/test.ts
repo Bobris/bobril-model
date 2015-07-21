@@ -1,8 +1,19 @@
 let actionHandlers: { [name: string]: (any) => void } = Object.create(null);
 
+let transactionNumber = 0;
+let dispatchNesting = 0;
+
 let dispatch = (name: string, param: any): void => {
-    console.log('dispatching', name, param);
-    actionHandlers[name](param);
+    console.log('dispatching', name, param, 'nesting', dispatchNesting);
+    if (dispatchNesting === 0) {
+        transactionNumber++;
+    }
+    dispatchNesting++;
+    try {
+        actionHandlers[name](param);
+    } finally {
+        dispatchNesting--;
+    }
 }
 
 function registerActionHandler(handler: (any) => void, name?: string): string {
@@ -39,17 +50,38 @@ function createAction<T>(injectors: IInjector[], handler: (T, ...injected: any[]
         handler.apply(null, params);
     }
     const actionName = registerActionHandler(injectedHandler, name);
-    let fn = (param: T): void => {
+    let fn = <IAction<T>>((param: T): void => {
         dispatch(actionName, param);
-    };
-    (<IAction<T>>fn).actionName = actionName;
-    return <IAction<T>>fn;
+    });
+    fn.actionName = actionName;
+    return fn;
+}
+
+interface IModelCtx {
+    modelTo: IModel;
+    parentCtx: IModelCtx;
+    key: number | string;
+}
+
+interface IAccessModel {
+    get(): any;
+    model: IModel;
+    modelCtx: IModelCtx;
+    modifiedInTransaction(): number;
+    childCount(): number;
+    child(index: number): IAccessModel;
+
+    modify(): any; // makes sence to call only on nonscalar
+    set(value: any): boolean; // makes sence to call mostly on scalars, returns true when change detected
 }
 
 interface IModel {
     uniqueName: string;
     parent: IModel;
     name: string;
+    isScalar: boolean;
+    createEmptyInstance(): any;
+    createAccessModel(parentModel: IModel): (parent: IAccessModel) => IAccessModel;
 }
 
 let uniqueNameModelCounter = 0;
@@ -57,17 +89,146 @@ function uniqueNameModelGenerator(): string {
     return '' + (uniqueNameModelCounter++);
 }
 
+let rootModifiedInTransaction: number = 0;
+let rootModelInstance: IModel = null;
+let rootModelData: any = null;
+let rootAccessModel: IAccessModel = null;
+
+class RootModel implements IModel {
+    uniqueName: string;
+    parent: IModel;
+    name: string;
+    itemModel: IModel;
+    isScalar: boolean;
+    constructor(model: IModel) {
+        this.uniqueName = uniqueNameModelGenerator();
+        this.parent = null;
+        this.name = 'root';
+        this.itemModel = model;
+        this.isScalar = true;
+        model.parent = this;
+        model.name = model.name || 'rootModel';
+        rootModelInstance = this;
+        rootModelData = null;
+        let itemAccessModelCreator = model.createAccessModel(this);
+        let itemAccessModel: IAccessModel = null;
+        rootAccessModel = {
+            get(): any {
+                return rootModelData;
+            },
+            model: rootModelInstance,
+            modelCtx: null,
+            modifiedInTransaction(): number {
+                return rootModifiedInTransaction;
+            },
+            childCount(): number {
+                return 1;
+            },
+            child(index: number): IAccessModel {
+                return itemAccessModel;
+            },
+            modify(): any {
+                return rootModelData;
+            },
+            set(value: any): boolean {
+                if (value !== rootModelData) {
+                    rootModelData = value;
+                    rootModifiedInTransaction = transactionNumber;
+                    return true;
+                }
+                return false;
+            }
+        };
+        itemAccessModel = itemAccessModelCreator(rootAccessModel);
+    }
+
+    createEmptyInstance(): any {
+        throw new Error('You cannot create root instance. It always exists');
+    }
+
+    createAccessModel(parentModel: IModel): (parent: IAccessModel) => IAccessModel {
+        return () => rootAccessModel;
+    }
+}
+
+class ObjectAccessModelWithScalarParent implements IAccessModel {
+    modelCtx: IModelCtx;
+    memberCount: number;
+
+    constructor(public model: ObjectModel, public parent: IAccessModel) {
+        this.modelCtx = parent.modelCtx;
+        this.memberCount = this.model.memberNames.length;
+    }
+
+    get(): any {
+        let i = this.parent.get();
+        if (i == null) {
+            i = this.model.createEmptyInstance();
+            this.parent.set(i);
+        }
+    }
+
+    modifiedInTransaction(): number {
+        return this.get()[0];
+    }
+
+    childCount(): number {
+        return this.memberCount;
+    }
+
+    child(index: number): IAccessModel {
+        return this.model.memberAccessCreators[index](this.parent);
+    }
+
+    modify(): any {
+        let i = this.get();
+        if (i[0] === transactionNumber)
+            return i;
+        i = i.split(0);
+        i[0] = transactionNumber;
+        this.parent.set(i);
+        return i;
+    }
+
+    set(value: any): boolean {
+        let inst = this.get();
+        if (inst === value) return false;
+        const memberCount = this.memberCount;
+        if (!Array.isArray(value) || value.length !== memberCount + 1) {
+            throw new Error('Type does not match');
+        }
+        let i = 0;
+        let ii = 1;
+        for (; i < this.memberCount; i++ , ii++) {
+            if (inst[ii] !== value[ii]) {
+                inst = this.modify();
+                for (; i < this.memberCount; i++ , ii++) {
+                    inst[ii] = value[ii];
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
 class ObjectModel implements IModel {
     uniqueName: string;
     parent: IModel;
     name: string;
+    isScalar: boolean;
     members: { [name: string]: IModel };
+    memberNames: string[];
 
     constructor(name?: string) {
         this.uniqueName = uniqueNameModelGenerator();
         this.parent = null;
         this.name = name || 'object';
+        this.isScalar = false;
         this.members = Object.create(null);
+        this.memberNames = [];
+        this.emptyInstance = undefined;
+        this.memberAccessCreators = undefined;
     }
 
     memberModel(name: string): IModel {
@@ -75,6 +236,9 @@ class ObjectModel implements IModel {
     }
 
     add<T extends IModel>(name: string, model: T): T {
+        if (this.emptyInstance !== undefined) throw new Error('Cannot modify freezed/used structure');
+        if (name in this.members) throw new Error('Member ' + name + ' already exists in ' + this.name);
+        this.memberNames.push(name);
         this.members[name] = model;
         model.name = name;
         model.parent = this;
@@ -86,6 +250,40 @@ class ObjectModel implements IModel {
         for (let i = 0; i < names.length; i++) {
             let name = names[i];
             this.add(name, <IModel>members[name]);
+        }
+    }
+
+    emptyInstance: any[];
+    memberAccessCreators: ((parent: IAccessModel) => IAccessModel)[];
+
+    closeModelForModification() {
+        if (this.emptyInstance !== undefined)
+            return;
+        let inst = [0];
+        let creators = [];
+        for (let i = 0; i < this.memberNames.length; i++) {
+            let k = this.memberNames[i];
+            let m = this.members[k];
+            inst.push(m.createEmptyInstance());
+            creators.push(m.createAccessModel(this));
+        }
+        this.emptyInstance = inst;
+        this.memberAccessCreators = creators;
+    }
+
+    createEmptyInstance(): any {
+        this.closeModelForModification();
+        return this.emptyInstance;
+    }
+
+    createAccessModel(parentModel: IModel): (parent: IAccessModel) => IAccessModel {
+        this.closeModelForModification();
+        if (parentModel.isScalar) {
+            return (parent: IAccessModel) => {
+                return new ObjectAccessModelWithScalarParent(this, parent);
+            };
+        } else {
+
         }
     }
 }
@@ -102,6 +300,10 @@ class ArrayModel<T extends IModel> implements IModel {
         this.itemModel = itemModel;
         this.name = itemModel.name + '[]';
     }
+
+    createEmptyInstance(): any {
+        return [];
+    }
 }
 
 class OptionalModel<T extends IModel> implements IModel {
@@ -111,6 +313,10 @@ class OptionalModel<T extends IModel> implements IModel {
     itemModel: T;
     constructor(itemModel: T) {
         this.itemModel = itemModel;
+    }
+
+    createEmptyInstance(): any {
+        return null;
     }
 }
 
@@ -123,6 +329,11 @@ class StringModel implements IModel {
         this.parent = null;
         this.name = null;
     }
+
+    createEmptyInstance(): any {
+        return '';
+    }
+
 }
 
 class BooleanModel implements IModel {
@@ -134,13 +345,13 @@ class BooleanModel implements IModel {
         this.parent = null;
         this.name = null;
     }
+
+    createEmptyInstance(): any {
+        return false;
+    }
 }
 
-interface IModelCtx {
-
-}
-
-var rootModel = new ObjectModel('root');
+var rootModel = new ObjectModel();
 
 var root = {
     todos: new ArrayModel(new ObjectModel('todo'))
@@ -154,7 +365,7 @@ var todo = {
 
 root.todos.itemModel.addFrom(todo);
 
-interface Todo {
+interface ITodo {
     name: string;
     done: boolean;
 }
