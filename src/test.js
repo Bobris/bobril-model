@@ -53,101 +53,228 @@ let rootModifiedInTransaction = 0;
 let rootModelInstance = null;
 let rootModelData = null;
 let rootAccessModel = null;
+function throwReadOnly() {
+    throw new Error('ReadOnly');
+}
+const rootModelReadOnlyAccessor = {
+    getModel() {
+        return rootModelInstance;
+    },
+    getParent() {
+        return null;
+    },
+    getKey() {
+        return undefined;
+    },
+    get() {
+        return rootModelData;
+    },
+    getReadOnly() {
+        return true;
+    },
+    getLastModified() {
+        return rootModifiedInTransaction;
+    },
+    set(value) {
+        throwReadOnly();
+        return false;
+    },
+    getChildCount() {
+        return 0;
+    },
+    getChild(index) {
+        return undefined;
+    },
+    modify() {
+        throwReadOnly();
+        return undefined;
+    }
+};
+const rootModelReadWriteAccessor = {
+    getModel() {
+        return rootModelInstance;
+    },
+    getParent() {
+        return null;
+    },
+    getKey() {
+        return undefined;
+    },
+    get() {
+        return rootModelData;
+    },
+    getReadOnly() {
+        return false;
+    },
+    getLastModified() {
+        return rootModifiedInTransaction;
+    },
+    set(value) {
+        if (rootModelData !== value) {
+            rootModelData = value;
+            rootModifiedInTransaction = transactionNumber;
+            return true;
+        }
+        return false;
+    },
+    getChildCount() {
+        return false;
+    },
+    getChild(index) {
+        return undefined;
+    },
+    modify() {
+        return rootModelData;
+    }
+};
 class RootModel {
     constructor(model) {
         this.uniqueName = uniqueNameModelGenerator();
         this.parent = null;
         this.name = 'root';
         this.itemModel = model;
-        this.isScalar = true;
         model.parent = this;
         model.name = model.name || 'rootModel';
         rootModelInstance = this;
-        rootModelData = null;
-        let itemAccessModelCreator = model.createAccessModel(this);
-        let itemAccessModel = null;
-        rootAccessModel = {
-            get() {
-                return rootModelData;
-            },
-            model: rootModelInstance,
-            modelCtx: null,
-            modifiedInTransaction() {
-                return rootModifiedInTransaction;
-            },
-            childCount() {
-                return 1;
-            },
-            child(index) {
-                return itemAccessModel;
-            },
-            modify() {
-                return rootModelData;
-            },
-            set(value) {
-                if (value !== rootModelData) {
-                    rootModelData = value;
-                    rootModifiedInTransaction = transactionNumber;
-                    return true;
-                }
-                return false;
-            }
-        };
-        itemAccessModel = itemAccessModelCreator(rootAccessModel);
+        rootModelData = undefined;
     }
     createEmptyInstance() {
         throw new Error('You cannot create root instance. It always exists');
     }
-    createAccessModel(parentModel) {
-        return () => rootAccessModel;
+    createReadOnlyRawAccess() {
+        if (rootModelData === undefined) {
+            rootModelData = this.itemModel.createEmptyInstance();
+        }
+        return rootModelReadOnlyAccessor;
+    }
+    createReadWriteRawAccess() {
+        if (rootModelData === undefined) {
+            rootModelData = this.itemModel.createEmptyInstance();
+        }
+        return rootModelReadWriteAccessor;
+    }
+    createAccessModel(rawAccess) {
+        return rawAccess;
     }
 }
-class ObjectAccessModelWithScalarParent {
-    constructor(model, parent) {
+class StandaloneReadOnlyRawAccess {
+    constructor(model) {
         this.model = model;
-        this.parent = parent;
-        this.modelCtx = parent.modelCtx;
-        this.memberCount = this.model.memberNames.length;
+        this.instance = model.createEmptyInstance();
+    }
+    getModel() {
+        return this.model;
+    }
+    getParent() {
+        return null;
+    }
+    getKey() {
+        return undefined;
     }
     get() {
-        let i = this.parent.get();
-        if (i == null) {
-            i = this.model.createEmptyInstance();
-            this.parent.set(i);
+        return this.instance;
+    }
+    getReadOnly() {
+        return true;
+    }
+    getLastModified() {
+        return 0;
+    }
+    set(value) {
+        throwReadOnly();
+        return false;
+    }
+}
+class StandaloneReadWriteRawAccess {
+    constructor(model) {
+        this.model = model;
+        this.instance = model.createEmptyInstance();
+        this.modified = false;
+    }
+    getModel() {
+        return this.model;
+    }
+    getParent() {
+        return null;
+    }
+    getKey() {
+        return undefined;
+    }
+    get() {
+        return this.instance;
+    }
+    getReadOnly() {
+        return false;
+    }
+    getLastModified() {
+        return this.modified ? transactionNumber : 0;
+    }
+    set(value) {
+        if (this.instance !== value) {
+            this.instance = value;
+            this.modified = true;
+            return true;
         }
+        return false;
     }
-    modifiedInTransaction() {
-        return this.get()[0];
+}
+class ObjectMemberAccessor {
+    constructor(owner, index) {
+        this.owner = owner;
+        this.index = index + 1;
     }
-    childCount() {
-        return this.memberCount;
+    getModel() {
+        return null;
     }
-    child(index) {
-        return this.model.memberAccessCreators[index](this.parent);
+    getParent() {
+        return this.owner;
     }
-    modify() {
-        let i = this.get();
-        if (i[0] === transactionNumber)
-            return i;
-        i = i.split(0);
-        i[0] = transactionNumber;
-        this.parent.set(i);
-        return i;
+    getKey() {
+        return undefined;
     }
+    get() {
+        return this.owner.get()[this.index];
+    }
+    getReadOnly() {
+        return this.owner.getReadOnly();
+    }
+    getLastModified() {
+        return this.owner.getLastModified();
+    }
+    set(value) {
+        if (this.get() !== value) {
+            let i = this.owner.modify();
+            i[this.index] = value;
+            return true;
+        }
+        return false;
+    }
+}
+class ObjectAccessor {
+    constructor(model, raw) {
+        this.model = model;
+        this.raw = raw;
+    }
+    getModel() { return this.model; }
+    getParent() { return this.raw.getParent(); }
+    getKey() { return this.raw.getKey(); }
+    get() { return this.raw.get(); }
+    getReadOnly() { return this.raw.getReadOnly(); }
+    getLastModified() { return this.get()[0]; }
     set(value) {
         let inst = this.get();
         if (inst === value)
             return false;
-        const memberCount = this.memberCount;
+        const memberCount = this.model.memberNames.length;
         if (!Array.isArray(value) || value.length !== memberCount + 1) {
             throw new Error('Type does not match');
         }
         let i = 0;
         let ii = 1;
-        for (; i < this.memberCount; i++, ii++) {
+        for (; i < memberCount; i++, ii++) {
             if (inst[ii] !== value[ii]) {
                 inst = this.modify();
-                for (; i < this.memberCount; i++, ii++) {
+                for (; i < memberCount; i++, ii++) {
                     inst[ii] = value[ii];
                 }
                 return true;
@@ -155,17 +282,28 @@ class ObjectAccessModelWithScalarParent {
         }
         return false;
     }
+    getChildCount() { return this.model.memberNames.length; }
+    getChild(index) {
+        return new ObjectMemberAccessor(this, index);
+    }
+    modify() {
+        let i = this.get();
+        if (i[0] === transactionNumber)
+            return i;
+        i = i.split(0);
+        i[0] = transactionNumber;
+        this.raw.set(i);
+        return i;
+    }
 }
 class ObjectModel {
     constructor(name) {
         this.uniqueName = uniqueNameModelGenerator();
         this.parent = null;
         this.name = name || 'object';
-        this.isScalar = false;
         this.members = Object.create(null);
         this.memberNames = [];
         this.emptyInstance = undefined;
-        this.memberAccessCreators = undefined;
     }
     memberModel(name) {
         return this.members[name];
@@ -192,29 +330,27 @@ class ObjectModel {
         if (this.emptyInstance !== undefined)
             return;
         let inst = [0];
-        let creators = [];
         for (let i = 0; i < this.memberNames.length; i++) {
             let k = this.memberNames[i];
             let m = this.members[k];
             inst.push(m.createEmptyInstance());
-            creators.push(m.createAccessModel(this));
         }
         this.emptyInstance = inst;
-        this.memberAccessCreators = creators;
     }
     createEmptyInstance() {
         this.closeModelForModification();
         return this.emptyInstance;
     }
-    createAccessModel(parentModel) {
+    createReadOnlyRawAccess() {
         this.closeModelForModification();
-        if (parentModel.isScalar) {
-            return (parent) => {
-                return new ObjectAccessModelWithScalarParent(this, parent);
-            };
-        }
-        else {
-        }
+        return new StandaloneReadOnlyRawAccess(this);
+    }
+    createReadWriteRawAccess() {
+        this.closeModelForModification();
+        return new StandaloneReadWriteRawAccess(this);
+    }
+    createAccessModel(rawAccess) {
+        return new ObjectAccessor(this, rawAccess);
     }
 }
 class ArrayModel {
@@ -258,6 +394,7 @@ class BooleanModel {
     }
 }
 var rootModel = new ObjectModel();
+new RootModel(rootModel);
 var root = {
     todos: new ArrayModel(new ObjectModel('todo'))
 };

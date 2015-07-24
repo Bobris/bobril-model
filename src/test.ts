@@ -58,30 +58,33 @@ function createAction<T>(injectors: IInjector[], handler: (T, ...injected: any[]
 }
 
 interface IModelCtx {
-    modelTo: IModel;
-    parentCtx: IModelCtx;
-    key: number | string;
+    getModel(): IModel;
+    getParent(): IModelCtx;
+    getKey(): number | string;
 }
 
-interface IAccessModel {
+interface IRawAccessModel extends IModelCtx {
     get(): any;
-    model: IModel;
-    modelCtx: IModelCtx;
-    modifiedInTransaction(): number;
-    childCount(): number;
-    child(index: number): IAccessModel;
+    getReadOnly(): boolean;
+    getLastModified(): number;
+    set(value: any): boolean; // returns true if modified
+}
 
-    modify(): any; // makes sence to call only on nonscalar
-    set(value: any): boolean; // makes sence to call mostly on scalars, returns true when change detected
+interface IAccessModel extends IRawAccessModel {
+    // makes sence to call only on nonscalar
+    getChildCount(): number;
+    getChild(index: number): IRawAccessModel;
+    modify(): any;
 }
 
 interface IModel {
     uniqueName: string;
     parent: IModel;
     name: string;
-    isScalar: boolean;
     createEmptyInstance(): any;
-    createAccessModel(parentModel: IModel): (parent: IAccessModel) => IAccessModel;
+    createReadOnlyRawAccess(): IRawAccessModel;
+    createReadWriteRawAccess(): IRawAccessModel;
+    createAccessModel(rawAccess: IRawAccessModel): IAccessModel;
 }
 
 let uniqueNameModelCounter = 0;
@@ -94,115 +97,256 @@ let rootModelInstance: IModel = null;
 let rootModelData: any = null;
 let rootAccessModel: IAccessModel = null;
 
+function throwReadOnly() {
+    throw new Error('ReadOnly');
+}
+
+const rootModelReadOnlyAccessor: IAccessModel = {
+    getModel(): IModel {
+        return rootModelInstance;
+    },
+    getParent(): IModelCtx {
+        return null;
+    },
+    getKey(): number | string {
+        return undefined;
+    },
+    get(): any {
+        return rootModelData;
+    },
+    getReadOnly(): boolean {
+        return true;
+    },
+    getLastModified(): number {
+        return rootModifiedInTransaction;
+    },
+    set(value: any): boolean {
+        throwReadOnly(); return false;
+    },
+    getChildCount(): number {
+        return 0;
+    },
+    getChild(index: number): IRawAccessModel {
+        return undefined;
+    },
+    modify(): any {
+        throwReadOnly(); return undefined;
+    }
+}
+
+const rootModelReadWriteAccessor: IAccessModel = {
+    getModel(): IModel {
+        return rootModelInstance;
+    },
+    getParent(): IModelCtx {
+        return null;
+    },
+    getKey(): number | string {
+        return undefined;
+    },
+    get(): any {
+        return rootModelData;
+    },
+    getReadOnly(): boolean {
+        return false;
+    },
+    getLastModified(): number {
+        return rootModifiedInTransaction;
+    },
+    set(value: any): boolean {
+        if (rootModelData !== value) {
+            rootModelData = value;
+            rootModifiedInTransaction = transactionNumber;
+            return true;
+        }
+        return false;
+    },
+    getChildCount(): number {
+        return false;
+    },
+    getChild(index: number): IRawAccessModel {
+        return undefined;
+    },
+    modify(): any {
+        return rootModelData;
+    }
+}
+
 class RootModel implements IModel {
     uniqueName: string;
     parent: IModel;
     name: string;
     itemModel: IModel;
-    isScalar: boolean;
     constructor(model: IModel) {
         this.uniqueName = uniqueNameModelGenerator();
         this.parent = null;
         this.name = 'root';
         this.itemModel = model;
-        this.isScalar = true;
         model.parent = this;
         model.name = model.name || 'rootModel';
         rootModelInstance = this;
-        rootModelData = null;
-        let itemAccessModelCreator = model.createAccessModel(this);
-        let itemAccessModel: IAccessModel = null;
-        rootAccessModel = {
-            get(): any {
-                return rootModelData;
-            },
-            model: rootModelInstance,
-            modelCtx: null,
-            modifiedInTransaction(): number {
-                return rootModifiedInTransaction;
-            },
-            childCount(): number {
-                return 1;
-            },
-            child(index: number): IAccessModel {
-                return itemAccessModel;
-            },
-            modify(): any {
-                return rootModelData;
-            },
-            set(value: any): boolean {
-                if (value !== rootModelData) {
-                    rootModelData = value;
-                    rootModifiedInTransaction = transactionNumber;
-                    return true;
-                }
-                return false;
-            }
-        };
-        itemAccessModel = itemAccessModelCreator(rootAccessModel);
+        rootModelData = undefined;
     }
 
     createEmptyInstance(): any {
         throw new Error('You cannot create root instance. It always exists');
     }
 
-    createAccessModel(parentModel: IModel): (parent: IAccessModel) => IAccessModel {
-        return () => rootAccessModel;
+    createReadOnlyRawAccess(): IRawAccessModel {
+        if (rootModelData === undefined) {
+            rootModelData = this.itemModel.createEmptyInstance();
+        }
+        return rootModelReadOnlyAccessor;
+    }
+
+    createReadWriteRawAccess(): IRawAccessModel {
+        if (rootModelData === undefined) {
+            rootModelData = this.itemModel.createEmptyInstance();
+        }
+        return rootModelReadWriteAccessor;
+    }
+
+    createAccessModel(rawAccess: IRawAccessModel): IAccessModel {
+        return <IAccessModel>rawAccess;
     }
 }
 
-class ObjectAccessModelWithScalarParent implements IAccessModel {
-    modelCtx: IModelCtx;
-    memberCount: number;
-
-    constructor(public model: ObjectModel, public parent: IAccessModel) {
-        this.modelCtx = parent.modelCtx;
-        this.memberCount = this.model.memberNames.length;
+class StandaloneReadOnlyRawAccess implements IRawAccessModel {
+    constructor(model: IModel) {
+        this.model = model;
+        this.instance = model.createEmptyInstance();
     }
 
+    model: IModel;
+    instance: any;
+
+    getModel(): IModel {
+        return this.model;
+    }
+    getParent(): IModelCtx {
+        return null;
+    }
+    getKey(): number | string {
+        return undefined;
+    }
     get(): any {
-        let i = this.parent.get();
-        if (i == null) {
-            i = this.model.createEmptyInstance();
-            this.parent.set(i);
+        return this.instance;
+    }
+    getReadOnly(): boolean {
+        return true;
+    }
+    getLastModified(): number {
+        return 0;
+    }
+    set(value: any): boolean {
+        throwReadOnly(); return false;
+    }
+}
+
+class StandaloneReadWriteRawAccess implements IRawAccessModel {
+    constructor(model: IModel) {
+        this.model = model;
+        this.instance = model.createEmptyInstance();
+        this.modified = false;
+    }
+
+    model: IModel;
+    instance: any;
+    modified: boolean;
+
+    getModel(): IModel {
+        return this.model;
+    }
+    getParent(): IModelCtx {
+        return null;
+    }
+    getKey(): number | string {
+        return undefined;
+    }
+    get(): any {
+        return this.instance;
+    }
+    getReadOnly(): boolean {
+        return false;
+    }
+    getLastModified(): number {
+        return this.modified ? transactionNumber : 0;
+    }
+    set(value: any): boolean {
+        if (this.instance !== value) {
+            this.instance = value;
+            this.modified = true;
+            return true;
         }
+        return false;
+    }
+}
+
+class ObjectMemberAccessor implements IRawAccessModel {
+    constructor(owner: IAccessModel, index: number) {
+        this.owner = owner;
+        this.index = index + 1;
     }
 
-    modifiedInTransaction(): number {
-        return this.get()[0];
+    owner: IAccessModel;
+    index: number;
+
+    getModel(): IModel {
+        return null;
+    }
+    getParent(): IModelCtx {
+        return this.owner;
+    }
+    getKey(): number | string {
+        return undefined;
+    }
+    get(): any {
+        return this.owner.get()[this.index];
+    }
+    getReadOnly(): boolean {
+        return this.owner.getReadOnly();
+    }
+    getLastModified(): number {
+        return this.owner.getLastModified();
+    }
+    set(value: any): boolean {
+        if (this.get() !== value) {
+            let i = this.owner.modify();
+            i[this.index] = value;
+            return true;
+        }
+        return false;
+    }
+}
+
+class ObjectAccessor implements IAccessModel {
+    constructor(model: ObjectModel, raw: IRawAccessModel) {
+        this.model = model;
+        this.raw = raw;
     }
 
-    childCount(): number {
-        return this.memberCount;
-    }
+    model: ObjectModel;
+    raw: IRawAccessModel;
 
-    child(index: number): IAccessModel {
-        return this.model.memberAccessCreators[index](this.parent);
-    }
-
-    modify(): any {
-        let i = this.get();
-        if (i[0] === transactionNumber)
-            return i;
-        i = i.split(0);
-        i[0] = transactionNumber;
-        this.parent.set(i);
-        return i;
-    }
-
+    getModel(): IModel { return this.model; }
+    getParent(): IModelCtx { return this.raw.getParent(); }
+    getKey(): number | string { return this.raw.getKey(); }
+    get(): any { return this.raw.get(); }
+    getReadOnly(): boolean { return this.raw.getReadOnly(); }
+    getLastModified(): number { return this.get()[0]; }
     set(value: any): boolean {
         let inst = this.get();
         if (inst === value) return false;
-        const memberCount = this.memberCount;
+        const memberCount = this.model.memberNames.length;
         if (!Array.isArray(value) || value.length !== memberCount + 1) {
             throw new Error('Type does not match');
         }
         let i = 0;
         let ii = 1;
-        for (; i < this.memberCount; i++ , ii++) {
+        for (; i < memberCount; i++ , ii++) {
             if (inst[ii] !== value[ii]) {
                 inst = this.modify();
-                for (; i < this.memberCount; i++ , ii++) {
+                for (; i < memberCount; i++ , ii++) {
                     inst[ii] = value[ii];
                 }
                 return true;
@@ -210,13 +354,25 @@ class ObjectAccessModelWithScalarParent implements IAccessModel {
         }
         return false;
     }
+    getChildCount(): number { return this.model.memberNames.length; }
+    getChild(index: number): IRawAccessModel {
+        return new ObjectMemberAccessor(this, index);
+    }
+    modify(): any {
+        let i = this.get();
+        if (i[0] === transactionNumber)
+            return i;
+        i = i.split(0);
+        i[0] = transactionNumber;
+        this.raw.set(i);
+        return i;
+    }
 }
 
 class ObjectModel implements IModel {
     uniqueName: string;
     parent: IModel;
     name: string;
-    isScalar: boolean;
     members: { [name: string]: IModel };
     memberNames: string[];
 
@@ -224,11 +380,9 @@ class ObjectModel implements IModel {
         this.uniqueName = uniqueNameModelGenerator();
         this.parent = null;
         this.name = name || 'object';
-        this.isScalar = false;
         this.members = Object.create(null);
         this.memberNames = [];
         this.emptyInstance = undefined;
-        this.memberAccessCreators = undefined;
     }
 
     memberModel(name: string): IModel {
@@ -254,21 +408,17 @@ class ObjectModel implements IModel {
     }
 
     emptyInstance: any[];
-    memberAccessCreators: ((parent: IAccessModel) => IAccessModel)[];
 
     closeModelForModification() {
         if (this.emptyInstance !== undefined)
             return;
         let inst = [0];
-        let creators = [];
         for (let i = 0; i < this.memberNames.length; i++) {
             let k = this.memberNames[i];
             let m = this.members[k];
             inst.push(m.createEmptyInstance());
-            creators.push(m.createAccessModel(this));
         }
         this.emptyInstance = inst;
-        this.memberAccessCreators = creators;
     }
 
     createEmptyInstance(): any {
@@ -276,15 +426,18 @@ class ObjectModel implements IModel {
         return this.emptyInstance;
     }
 
-    createAccessModel(parentModel: IModel): (parent: IAccessModel) => IAccessModel {
+    createReadOnlyRawAccess(): IRawAccessModel {
         this.closeModelForModification();
-        if (parentModel.isScalar) {
-            return (parent: IAccessModel) => {
-                return new ObjectAccessModelWithScalarParent(this, parent);
-            };
-        } else {
+        return new StandaloneReadOnlyRawAccess(this);
+    }
 
-        }
+    createReadWriteRawAccess(): IRawAccessModel {
+        this.closeModelForModification();
+        return new StandaloneReadWriteRawAccess(this);
+    }
+
+    createAccessModel(rawAccess: IRawAccessModel): IAccessModel {
+        return new ObjectAccessor(this, rawAccess);
     }
 }
 
@@ -352,6 +505,7 @@ class BooleanModel implements IModel {
 }
 
 var rootModel = new ObjectModel();
+new RootModel(rootModel);
 
 var root = {
     todos: new ArrayModel(new ObjectModel('todo'))
@@ -382,7 +536,7 @@ var addTodo = createAction<string>([
     injectArrayAppender(root.todos, todo.name, todo.done)
 ], (name: string,
     appender: (name: string, done: boolean) => void
-    ) => {
+) => {
         appender(name, false);
         // Send command to server
     }, 'addTodo');
@@ -398,7 +552,7 @@ var renameTodo = createAction<RenameTodo>([
     injectObjectModifier(root.todos.itemModel, todo.name)
 ], (param: RenameTodo,
     modifier: (todoCtx: IModelCtx, name: string) => boolean
-    ) => {
+) => {
         if (modifier(param.todoCtx, param.name)) {
             // Something changed send command to server
         }
