@@ -20,6 +20,16 @@
         "!./node_modules/**/*"
     ],
     "files": [
+        "./RuntimeFunctionGenerator.ts",
+        "./arraymodel.ts",
+        "./booleanmodel.ts",
+        "./dispatcher.ts",
+        "./genModelHelpers.ts",
+        "./model.ts",
+        "./objectmodel.ts",
+        "./optionalmodel.ts",
+        "./rootmodel.ts",
+        "./stringmodel.ts",
         "./test.ts"
     ]
 }
